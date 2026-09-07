@@ -64,9 +64,32 @@
 #  define RSSI_SAMPLES 50000
 #endif
 
+// Number of RSSI samples collected before enabling reception at startup
+#ifndef RSSI_INITIAL_SAMPLES
+#  define RSSI_INITIAL_SAMPLES 1000
+#endif
+
 //  Amount to add to average RSSI to determine if a signal is present
 #ifndef RSSI_THRESHOLD
 #  define RSSI_THRESHOLD 9
+#endif
+
+// CC1101 OOK receiver settings. These defaults preserve the effective values
+// used by rtl_433_ESP before the settings were made configurable.
+#ifndef CC1101_RX_BANDWIDTH
+#  define CC1101_RX_BANDWIDTH 812.0f
+#endif
+
+#ifndef CC1101_AGCCTRL2
+#  define CC1101_AGCCTRL2 0xC7
+#endif
+
+#ifndef CC1101_AGCCTRL1
+#  define CC1101_AGCCTRL1 0x40
+#endif
+
+#ifndef CC1101_AGCCTRL0
+#  define CC1101_AGCCTRL0 0xB2
 #endif
 
 // Enable setting of RSSI Signal threshold based on backgroup signal level
@@ -88,12 +111,25 @@
 
 // signals shorter than this are ignored in interrupt handler
 
+// Overridable from build flags. Defaults are unchanged; only the guards are new.
+//
+// Without a guard the header's #define wins over any -D on the command line, so
+// a protocol whose symbol period or frame duration falls below the defaults
+// cannot be received without editing the library.
 #if OOK_MODULATION
-#  define MINIMUM_PULSE_LENGTH  50
-#  define MINIMUM_SIGNAL_LENGTH 40000
+#  ifndef MINIMUM_PULSE_LENGTH
+#    define MINIMUM_PULSE_LENGTH 50
+#  endif
+#  ifndef MINIMUM_SIGNAL_LENGTH
+#    define MINIMUM_SIGNAL_LENGTH 40000
+#  endif
 #else
-#  define MINIMUM_PULSE_LENGTH  30
-#  define MINIMUM_SIGNAL_LENGTH 500
+#  ifndef MINIMUM_PULSE_LENGTH
+#    define MINIMUM_PULSE_LENGTH 30
+#  endif
+#  ifndef MINIMUM_SIGNAL_LENGTH
+#    define MINIMUM_SIGNAL_LENGTH 500
+#  endif
 #endif
 
 // SX127X OOK Reception Floor
@@ -186,17 +222,22 @@
 #ifdef RF_CC1101
 #  define RF_MODULE_RECEIVER_GPIO RF_MODULE_GDO0
 #  define STR_MODULE              "CC1101"
+#  ifndef RF_MODULE_CS
+#    define RF_MODULE_CS SS
+#  endif
 #  if defined(RF_MODULE_SCK) && defined(RF_MODULE_MISO) && \
       defined(RF_MODULE_MOSI) && defined(RF_MODULE_CS)
 #    define RADIO_LIB_MODULE \
       new Module(RF_MODULE_CS, RF_MODULE_GDO0, RADIOLIB_NC, RF_MODULE_GDO2, newSPI)
 #  else
 #    define RADIO_LIB_MODULE \
-      new Module(SS, RF_MODULE_GDO0, RADIOLIB_NC, RF_MODULE_GDO2)
+      new Module(RF_MODULE_CS, RF_MODULE_GDO0, RADIOLIB_NC, RF_MODULE_GDO2)
 #  endif
 #endif
 
 /*-----------------------------  Logging Macros -----------------------------*/
+
+extern volatile bool rtl_433_radio_config_failed;
 
 #ifdef REGOOKFIX_DEBUG
 #  define RADIOLIB_STATE(STATEVAR, FUNCTION)                              \
@@ -206,8 +247,7 @@
       } else {                                                            \
         logprintfLn(LOG_ERR, STR_MODULE " " FUNCTION " failed, code: %d", \
                     STATEVAR);                                            \
-        while (true)                                                      \
-          ;                                                               \
+        rtl_433_radio_config_failed = true;                               \
       }                                                                   \
     }
 #else
@@ -216,8 +256,7 @@
       if ((STATEVAR) != RADIOLIB_ERR_NONE) {                              \
         logprintfLn(LOG_ERR, STR_MODULE " " FUNCTION " failed, code: %d", \
                     STATEVAR);                                            \
-        while (true)                                                      \
-          ;                                                               \
+        rtl_433_radio_config_failed = true;                               \
       }                                                                   \
     }
 #endif
@@ -226,9 +265,35 @@
  * message - JSON formatted message from device
  */
 typedef void (*rtl_433_ESPCallBack)(char* message);
+typedef void (*rtl_433_raw_pulse_cb)(const int* pulse_us, const int* gap_us,
+                                     unsigned int num_pulses,
+                                     unsigned long duration_us, int rssi);
+typedef struct pulse_data pulse_data_t;
 
 typedef std::function<void(const uint16_t* pulses, size_t length)>
     PulseTrainCallBack;
+
+enum class rtl_433_ESPError : uint8_t {
+  None = 0,
+  OutOfMemory,
+  RadioInitialization,
+  QueueCreation,
+  TaskCreation,
+  InvalidArgument,
+};
+
+struct rtl_433_ESPStatus {
+  unsigned int capturedSignals;
+  unsigned int decodedSignals;
+  unsigned int decodedMessages;
+  unsigned int zeroDecodedSignals;
+  unsigned int droppedCaptureBuffers;
+  unsigned int droppedDecoderQueue;
+  int currentRssi;
+  int averageRssi;
+  int rssiThreshold;
+  bool receiverEnabled;
+};
 
 class rtl_433_ESP {
 public:
@@ -258,6 +323,12 @@ public:
                    int bufferSize);
 
   /**
+   * Set callback to receive raw pulse train data for each captured signal.
+   * Pointers are valid only during callback execution.
+   */
+  void setRawPulsesCallback(rtl_433_raw_pulse_cb callback);
+
+  /**
    * Set minimum RSSI value for receiver
    */
   void setRSSIThreshold(int);
@@ -278,6 +349,16 @@ public:
    * receiveFrequency - Receiver Receive frequency
    */
   static void initReceiver(byte inputPin, float receiveFrequency);
+
+  /** Initialize the receiver and report failure without halting the device. */
+  static bool begin(byte inputPin, float receiveFrequency);
+
+  /** Stop reception and release library-owned tasks, queues, and buffers. */
+  static void end();
+
+  static bool isInitialized();
+  static rtl_433_ESPError lastError();
+  static rtl_433_ESPStatus statusSnapshot();
 
   /**
    * Enable pulse receiver interrupt and logic
@@ -334,11 +415,17 @@ public:
   /**
    * Functions used during testing
    */
-#if defined(setBitrate) || defined(setFreqDev) || defined(setRxBW)
+#if defined(setBitrate) || defined(setFreqDev) || defined(setRxBW) || \
+    defined(CC1101_OOK_TUNING)
+  int16_t setFrequency(float);
   int16_t setFrequencyDeviation(float);
   int16_t setBitRate(float);
   int16_t setRxBandwidth(float);
   int16_t receiveDirect();
+#  if defined(RF_CC1101)
+  int16_t setCC1101Register(uint8_t address, uint8_t value);
+  uint8_t getCC1101Register(uint8_t address);
+#  endif
 #endif
 
   /**
@@ -356,6 +443,13 @@ public:
   static int totalSignals;
   static int ignoredSignals;
   static int unparsedSignals;
+
+  /** Decoder outcomes accumulated since startup (or an explicit test reset). */
+  static volatile unsigned int decoderSignals;
+  static volatile unsigned int decodedMessages;
+  static volatile unsigned int zeroDecodedSignals;
+  static volatile unsigned int droppedCaptureBuffers;
+  static volatile unsigned int droppedDecoderQueue;
 
   static uint8_t OokFixedThreshold;
 
@@ -410,7 +504,7 @@ private:
    * Get last received PulseTrain.
    * Returns: last PulseTrain or 0 if not available
    */
-  static int receivePulseTrain();
+  static bool receivePulseTrain(pulse_data_t* destination);
 
   /**
    * _enabledReceiver: If true, monitoring and decoding is enabled.

@@ -45,9 +45,11 @@ extern "C" {
 
 /*----------------------------- functions -----------------------------*/
 
-void rtlSetup();
+bool rtlSetup();
+void rtlShutdown();
 void _setCallback(rtl_433_ESPCallBack callback, char* messageBuffer,
                   int bufferSize);
+void _setRawPulsesCallback(rtl_433_raw_pulse_cb callback);
 void _setDebug(int debug);
 void processSignal(pulse_data_t* rtl_pulses);
 void rtl_433_DecoderTask(void* pvParameters);
